@@ -1,0 +1,257 @@
+
+##
+## Code: Read a .mat output from APDM Opal and calculate joint angles from a segment and its reference segment to compare
+##       with Visual 3D output as measured by Optitrack
+##
+
+## The example in this notebook is to calculate elbow angle in a desired window of the recording
+
+## Steps to run (if in jupyter notebook)
+#    1. Run import cell after making sure all libraries listed are installed
+#    2. Run all function definition cells
+#    3. Specify directory for APDM data and run APDM import cell
+#    4. Specify directory for C3D data and run C3D import cell
+#    5. Specify window for where to process APDM data and run APDM first window cell
+#    6. Specify frames from APDM data to plot and compare with C3D and desired axis of resulting euler angles 
+#       and run calculation cell
+
+## How it works: 
+#    1. Read in APDM IMU data and reference data from Visual 3D as measured by Driveline's Optitrack system
+#    2. Calculate difference in orientation between segment and its reference
+#        a. q' = conj(q1) * q2 where q' is the difference (elbow angle), q1 is reference segment (upper arm), q2 is the 
+#             distal segment (forearm)
+#    3. Convert difference in orientation to euler angles
+#    4. Choose which euler angle to use i.e. which axis of rotation
+#    5. Plot for visualization and comparison
+
+## Limitations of this approach:
+#    - Data from the recordings with Agresta et al. and Driveline were very long and resulted in large files, so 
+#      calculations for the whole recording can only be made on a relatively high powered computer with lots of RAM (I'm assuming)
+#          - This is why we specify a window to process in the 'APDM First Window Cell'
+#    - This file uses the .mat output file rather than the .h5 output file because it was easier to index since the 
+#      .h5 file in this case did not have labelled sensors as far as I could find.
+#          - all of the calculations would be the same from the .h5 files but reading and extracting the desired data would
+#            involve slightly different commands and indexing
+    
+## Notes:
+#    - Orientation signals such as the pelvis and torso are usually referenced in the global frame so it is unnecessary
+#      to conjugate and multiply by a reference segment. Their orientations in the form of a quaternion can simply be 
+#      converted to euler angles to find their orientation in x, y, and z axes - so only 'convert_all_quats' would 
+#      need to be used instead of 'calculate_joint_angle'
+    
+## Code is commented throughout in an attempt to describe all steps as well as possible. Feel free to reach out with any
+#  questions, concerns, or suggestions about this code and how to work with this data. 
+#
+#  Email: klindley@drivelinebaseball.com
+
+## Import cell, importing all necessary libraries
+#  Instructions: Make sure all of these libraries are installed then run
+import numpy as np; #For creating and working with arrays
+import scipy; #For possible signal processing from 'signal' package in 'scipy'
+from matplotlib import pyplot as pp
+import os; #For changing directories
+import pandas as pd; #For reading data files and working with data frames
+import h5py #For reading data files
+from pyquaternion import Quaternion #For converting to quatnerions and computing quaternion math
+
+# Function was created from a forum online, converting resultant quaternion to euler angles for better interpretation and 
+# comparison
+def quaternion_to_euler(x, y, z, w):
+
+        import math
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        X = math.degrees(math.atan2(t0, t1))
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        Y = math.degrees(math.asin(t2))
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        Z = math.degrees(math.atan2(t3, t4))
+
+        return X, Y, Z
+
+# Function to conjugate the reference quaternion for each sample of orientation 
+def conjugate_whole_signal(quat_signal):
+
+        #Create 2 dimensional numpy array to store the full signal of new conjugated quaternions
+        conj_quat_signal = np.zeros((4,len(quat_signal[1,:])))
+        m = 0
+        for quat_current in range(quat_signal.shape[1]):
+
+            #Convert current array to a quaternion data type
+            quat = Quaternion(np.transpose(quat_signal[:,quat_current]))
+
+            #Conjugate current quaternion
+            quat_conj = quat.conjugate
+
+            #Convert current conjugated quaternion back to array format to be saved
+            quat_conj_array = [float(quat_conj[0])]
+            quat_conj_array.append(float(quat_conj[1]))                               
+            quat_conj_array.append(float(quat_conj[2]))                                  
+            quat_conj_array.append(float(quat_conj[3]))                           
+            conj_quat_signal[:,quat_current-1] = np.transpose(quat_conj_array)
+            #Output full signal of conjugated quaternions
+        return(conj_quat_signal)
+
+def multiply_quat_signals(signal1, signal2):
+    
+    #Create 2 dimenional numpy array to store the full signal of multiplied quaternions representing a joint angle in this case
+    multiplied_quat_signal = np.zeros((4,len(signal1[1,:])))      
+
+    for i in range(0,(len(signal1[1,:])-1)):
+        
+        #Read both current arrays representing quaternions to be multiplied and convert both to quaternions
+        quat_1 = Quaternion(np.transpose(signal1[:,i]))
+        quat_2 = Quaternion(np.transpose(signal2[:,i]))
+        
+        #Multiply quaternions when they are still a quaternion data type
+        multiplied = quat_1 * quat_2
+        
+        #Convert product quaternion back to numpy arrays to be stored
+        array_maker = [float(multiplied[0])]
+        array_maker.append(float(multiplied[1]))
+        array_maker.append(float(multiplied[2]))
+        array_maker.append(float(multiplied[3]))
+        multiplied_quat_signal[:,i] = array_maker 
+        
+        #Output product quaternion
+    return multiplied_quat_signal
+
+#Function to convert a full signal of quaternions to a full signal of euler angles
+def convert_all_quats(quat):
+
+    #Creating 2 dimensional numpy array to story euler angles
+    degrees = np.zeros((3,len(quat[1,:])))    
+
+    #Looping through all quats and converting to euler angles
+    for i in range(0,(len(quat[1,:])-1)):
+
+            #Converting current quaternion
+            eul = quaternion_to_euler(quat[1,i],quat[2,i],quat[3,i],quat[0,i])
+
+            #Storing x, y, and z resultant angles 
+            x = eul[0]
+            y = eul[1]
+            z = eul[2]
+
+            #Creating array with euler angles
+            deg = [x]
+            deg.append(y)
+            deg.append(z)
+
+            #Storing current orientation in degrees
+            degrees[:,i] = deg     
+    
+    return degrees
+
+def calculate_joint_angle(reference, distal):
+    
+    #Conjugate reference segment
+    conj_reference = conjugate_whole_signal(reference)
+    
+    #Multiply distal segment by reference segment
+    quat_prod = multiply_quat_signals(conj_reference, distal)
+    
+    #Convert product quaternion to euler angles
+    prod_degrees = convert_all_quats(quat_prod)
+    
+    return prod_degrees
+
+def linear_resample(signal, signal_ref):
+    
+    #Step size based on lengths of the signals
+    step = int(len(signal)/len(signal_ref))
+    
+    #Resample
+    resampled = np.interp(np.linspace(0, len(signal), len(signal_ref)),range(0,len(signal)), signal)
+    
+    return (resampled)
+
+## APDM Import Cell
+#  Instructions: Sepecify directory with APDM Files
+# Location of desired .mat file
+os.chdir('D://IMU/')
+
+# Read APDM data in .mat format using h5py reader
+steve_total = h5py.File('20190702-131146_steve_driveline.mat')
+
+## C3D Import Cell
+#  Instructions: Specify directory with C3D files
+# Location of C3D files
+os.chdir('D://IMU/Steve Throw 3')
+
+# Read in c3d output of desired joint angle for comparison to APDM data, pull desired axis of rotation from that signal, 
+# and differentiate for rotational velocity
+right_elbow_c3d = pd.read_csv('Right Elbow.txt', sep = '\t',skiprows=1,usecols = [1,2,3,4])
+C3D_right_elbow_flexion = right_elbow_c3d.iloc[:,1]
+C3D_right_elbow_flexion_velocity = np.diff(C3D_right_elbow_flexion)*240
+
+## APDM First Window Cell
+#  Instructions: Specify which part of the whole recording you want to process
+
+# Length of full signal for possible indexing reasons
+length_of_signal = len(steve_total['IMU']['Rupperarm']['q'][1,:])
+
+# Window including second throw with motion capture data
+window2 = range(1770000,1771200)
+
+# Window including thrid throw with motion capture data. Don't need both of these, I was just looking at both
+window3 = range(1908000,1911000)
+
+# Extract quaternion orientations from the window of the forearm and the upperarm for reference
+right_upperarm = steve_total['IMU']['Rupperarm']['q'][:,window3]
+right_forearm = steve_total['IMU']['Rforearm']['q'][:,window3]
+
+## Joint Angle Calculation Cell
+#  Instructions: Specify which axis of euler angles and which APDM frames to plot and compare with C3D
+
+# Calculate Joint Angles from reference segment (argument 1) and the distal segment (argument 2)
+APDM_elbow_angle_degrees = calculate_joint_angle(right_upperarm,right_forearm)
+
+# This will take manual adjustment - find which axis is the correct one (which row to grab from the array) then 
+# how much of the signal you want to plot (which columns)
+xyz_choice = 0 #X = 0, y = 1, z = 2
+compare_window = range(525,1755) #Frames to compare with C3D and plot
+APDM_elbow_flex_angle = APDM_elbow_angle_degrees[xyz_choice,compare_window]
+
+# Resampling APDM data to match C3D output from optical motion capture data
+APDM_elbow_flex_angle = linear_resample(APDM_elbow_flex_angle, C3D_right_elbow_flexion)
+
+# Differentiate elbow flexion to get elbow flexion velo
+#   Note: 240 is used as the sample rate in this instant because differentiation is happening after resampling APDM data
+APDM_elbow_angular_velo = np.diff(APDM_elbow_flex_angle)*240
+
+## Start of plotting cells 
+
+#Plot elbow flexion full screen in new window
+get_ipython().run_line_magic('matplotlib', 'qt')
+pp.figure()
+pp.plot(APDM_elbow_flex_angle - (APDM_elbow_flex_angle[50]-C3D_right_elbow_flexion[50]))
+pp.plot(C3D_right_elbow_flexion)
+pp.suptitle('APDM vs. V3D')
+pp.ylabel('Elbow Angle')
+pp.legend(['APDM', 'V3D'])
+pp.xlabel('Frame')
+mng1 = pp.get_current_fig_manager()
+mng1.full_screen_toggle()
+
+#Close full screen elbow flexion plot
+#mng1.destroy()
+
+#Plot elbow flexion velocity full screen in new window
+pp.figure()
+pp.plot(APDM_elbow_angular_velo)
+pp.plot(C3D_right_elbow_flexion_velocity)
+pp.suptitle('APDM vs. V3D Angular Velo')
+pp.ylabel('Elbow Anglular velo')
+pp.legend(['APDM', 'V3D'])
+pp.xlabel('Frame')
+mng2 = pp.get_current_fig_manager()
+mng2.full_screen_toggle()
+
+#Close full screen elbow flexion velocity plot
+#mng2.destroy()
